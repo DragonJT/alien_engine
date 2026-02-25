@@ -198,7 +198,7 @@ fn parse_optional_header_pe32_and_dirs(r: &mut Reader) -> [DataDir; 16] {
 
 fn rva_to_file_offset(sections: &[Section], rva: u32) -> usize {
     for s in sections {
-        let start = s.virt_addr;
+        let start = s.virtual_address;
         let end_file_backed = start + s.raw_size; // safest for reading from file
         if rva >= start && rva < end_file_backed {
             return (s.raw_ptr + (rva - start)) as usize;
@@ -210,8 +210,8 @@ fn rva_to_file_offset(sections: &[Section], rva: u32) -> usize {
 #[derive(Clone, Debug)]
 pub struct Section {
     pub name:Vec<u8>,
-    pub virt_addr: u32,
-    pub virt_size: u32,
+    pub virtual_address: u32,
+    pub virtual_size: u32,
     pub raw_ptr: u32,
     pub raw_size: u32,
     pub characteristics: u32,
@@ -319,6 +319,25 @@ pub struct StreamInfo {
     pub size: usize,
 }
 
+impl StreamInfo {
+    pub fn slice<'a>(&self, bytes: &'a [u8], debug_name: &'static str) -> &'a [u8] {
+        let end = self.abs_off + self.size;
+        if end > bytes.len() {
+            panic!("stream {debug_name} out of bounds");
+        }
+        &bytes[self.abs_off..end]
+    }
+}
+
+#[derive(Debug)]
+pub struct Streams {
+    pub strings: StreamInfo,
+    pub blob: StreamInfo,
+    pub guid: StreamInfo,
+    pub user_strings: StreamInfo,
+    pub tables: StreamInfo, 
+}
+
 #[derive(Debug)]
 pub struct RawModule {
     pub bytes: Vec<u8>,
@@ -331,7 +350,7 @@ pub struct RawModule {
     pub meta_size: u32,
     pub meta_off: usize, // absolute file offset
 
-    pub streams: HashMap<String, StreamInfo>,
+    pub streams: Streams,
 
     pub heap_sizes: u8,
     pub valid_mask: u64,
@@ -340,23 +359,19 @@ pub struct RawModule {
 }
 
 impl RawModule {
-    pub fn heap(&self, name: &str) -> &[u8] {
-        let info = self.streams.get(name).unwrap_or_else(|| panic!("missing stream {name}"));
-        let end = info.abs_off + info.size;
-        if end > self.bytes.len() {
-            panic!("stream {name} out of bounds");
+    pub fn rva_to_file_off(&self, rva: u32) -> usize {
+        for sec in &self.sections {
+            let start = sec.virtual_address;
+            let size = sec.virtual_size.max(sec.raw_size);
+            let end = start + size;
+
+            if rva >= start && rva < end {
+                let offset_within_section = rva - start;
+                return (sec.raw_ptr + offset_within_section) as usize;
+            }
         }
-        &self.bytes[info.abs_off..end]
-    }
 
-    pub fn strings(&self) -> &[u8] { self.heap("#Strings") }
-    pub fn blob(&self) -> &[u8] { self.heap("#Blob") }
-    pub fn guid(&self) -> &[u8] { self.heap("#GUID") }
-    pub fn us(&self) -> &[u8] { self.heap("#US") }
-
-    pub fn tables_stream(&self) -> &[u8] {
-        if self.streams.contains_key("#~") { self.heap("#~") }
-        else { self.heap("#-") }
+        panic!("RVA {:#X} not inside any section", rva);
     }
 }
 
@@ -666,6 +681,16 @@ pub fn print_tables(raw: &RawTables, strings: &[u8]) {
     }
 }
 
+fn print_stream(name:&str, info:&StreamInfo)
+{
+    println!(
+        "{:<10} abs=0x{:08X} size={}",
+        name,
+        info.abs_off,
+        info.size
+    );
+}
+
 pub fn print_rawmodule(m: &RawModule) {
     println!("\n================ RAW MODULE ================\n");
 
@@ -685,8 +710,8 @@ pub fn print_rawmodule(m: &RawModule) {
             "[{:>2}] {:<8} VA=0x{:08X} VS=0x{:08X} RAW=0x{:08X} RS=0x{:08X} CHARS=0x{:08X}",
             i,
             name,
-            s.virt_addr,
-            s.virt_size,
+            s.virtual_address,
+            s.virtual_size,
             s.raw_ptr,
             s.raw_size,
             s.characteristics
@@ -695,14 +720,12 @@ pub fn print_rawmodule(m: &RawModule) {
 
     // --- Streams ---
     println!("\n--- Metadata Streams ---");
-    for (name, info) in &m.streams {
-        println!(
-            "{:<10} abs=0x{:08X} size={}",
-            name,
-            info.abs_off,
-            info.size
-        );
-    }
+    print_stream("Tables", &m.streams.tables);
+    print_stream("Strings", &m.streams.strings);
+    print_stream("Blob", &m.streams.blob);
+    print_stream("Guid", &m.streams.guid);
+    print_stream("UserStrings", &m.streams.user_strings);
+
 
     // --- #~ header facts ---
     println!("\n--- #~ Header ---");
@@ -722,7 +745,8 @@ pub fn print_rawmodule(m: &RawModule) {
 
     // --- Tables ---
     println!("\n--- Tables ---");
-    print_tables(&m.tables, m.strings());
+    let strings = m.streams.strings.slice(&m.bytes, "strings");
+    print_tables(&m.tables, strings);
 
     println!("\n============================================\n");
 }
@@ -767,7 +791,7 @@ pub fn load_raw_module(dllpath:&str) -> RawModule{
         let _num_linen = r.read_u16();
         let characteristics     = r.read_u32();
 
-        sections.push(Section { name, virt_addr, virt_size, raw_ptr, raw_size, characteristics });
+        sections.push(Section { name, virtual_address: virt_addr, virtual_size: virt_size, raw_ptr, raw_size, characteristics });
     }
     
     let cli_off = rva_to_file_offset(&sections, com.rva);
@@ -807,7 +831,7 @@ pub fn load_raw_module(dllpath:&str) -> RawModule{
     let _flags = r.read_u16();
     let streams_len = r.read_u16() as usize;
 
-    let mut streams: HashMap<String, StreamInfo> = HashMap::new();
+    let mut map: HashMap<String, StreamInfo> = HashMap::new();
     for _ in 0..streams_len {
         let off = r.read_u32() as usize;
         let size = r.read_u32() as usize;
@@ -821,14 +845,19 @@ pub fn load_raw_module(dllpath:&str) -> RawModule{
         r.align_from(meta_off, 4);
 
         let name = String::from_utf8(name_bytes).unwrap();
-        streams.insert(name, StreamInfo { abs_off: meta_off + off, size });
+        map.insert(name, StreamInfo { abs_off: meta_off + off, size });
     }
 
-    let string_stream = streams["#Strings"];
-    let strings_heap = r.peek_bytes(string_stream.abs_off, string_stream.size);
+    let tables = if map.contains_key("#~") {map["#~"]} else { map["#-"]};
+    let streams = Streams { 
+        strings: map["#Strings"], 
+        blob: map["#Blob"], 
+        guid: map["#GUID"], 
+        user_strings: map["#US"], 
+        tables 
+    };
 
-    let tables_stream = streams["#~"];
-    let tables_bytes = r.peek_bytes(tables_stream.abs_off, string_stream.size);
+    let tables_bytes = r.peek_bytes(streams.tables.abs_off, streams.tables.size);
     let mut tr = Reader::new(tables_bytes.to_vec());
 
     let _reserved = tr.read_u32();
