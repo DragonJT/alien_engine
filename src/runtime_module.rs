@@ -1,4 +1,5 @@
-use crate::raw_module::*;
+use std::collections::HashMap;
+use crate::{raw_module::*};
 
 const ELEMENT_TYPE_VOID: u8   = 0x01;
 const ELEMENT_TYPE_I4: u8     = 0x08;
@@ -13,6 +14,7 @@ pub enum ElemType {
     String,
 }
 
+#[derive(Clone)]
 pub struct MethodHeader {
     pub maxstack: u16,
     pub code_size: u32,
@@ -21,6 +23,7 @@ pub struct MethodHeader {
     pub init_locals: bool,
 }
 
+#[derive(Clone)]
 pub struct MethodSig {
     pub has_this: bool,
     pub param_count: u32,
@@ -28,13 +31,37 @@ pub struct MethodSig {
     pub params: Vec<ElemType>,
 }
 
+#[derive(Clone)]
 pub struct RuntimeMethod {
     pub token: u32,            // 0x06000000 | rid
     pub owner: u32,            // TypeDef token (0x02000000 | rid) or an index
     pub name: String,
-    pub sig: MethodSig,        // decoded from #Blob
-    pub header: MethodHeader,  // normalized
-    pub il: Vec<u8>,           // raw IL bytes (or a slice if you keep bytes alive)
+    pub sig: MethodSig,
+    pub body:Option<(MethodHeader, Vec<u8>)>,
+}
+
+pub struct RuntimeModule{
+    runtime_methods:Vec<RuntimeMethod>,
+}
+
+impl RuntimeModule{
+    pub fn get_method_by_token(&self, token:u32) -> RuntimeMethod{
+        for m in &self.runtime_methods{
+            if m.token == token{
+                return m.clone();
+            }
+        }
+        panic!("Cant find method");
+    }
+
+    pub fn get_method_by_name(&self, name:&str) -> RuntimeMethod{
+        for m in &self.runtime_methods{
+            if m.name == name{
+                return m.clone();
+            }
+        }
+        panic!("Cant find method");
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,10 +118,10 @@ fn parse_method_header(module: &[u8], file_off: usize) -> Option<MethodHeaderKin
     }
 }
 
-fn read_method_body(raw: &RawModule, rva: u32) -> (MethodHeader, Vec<u8>)
+fn read_method_body(raw: &RawModule, rva: u32) -> Option<(MethodHeader, Vec<u8>)>
 {
     if rva == 0 {
-        panic!("method has no body");
+        return None;
     }
 
     let file_off = raw.rva_to_file_off(rva);
@@ -116,7 +143,7 @@ fn read_method_body(raw: &RawModule, rva: u32) -> (MethodHeader, Vec<u8>)
                 has_more_sections: false,
             };
 
-            (header, il)
+            Some((header, il))
         }
 
         MethodHeaderKind::Fat {
@@ -143,10 +170,11 @@ fn read_method_body(raw: &RawModule, rva: u32) -> (MethodHeader, Vec<u8>)
                 has_more_sections: (flags & 0x08) != 0,
             };
 
-            (header, il)
+            Some((header, il))
         }
     }
 }
+
 fn compute_method_owners(raw: &RawModule) -> Vec<u32> {
     let typedef_count = raw.row_counts[2] as u32; // TypeDef
     let method_count  = raw.row_counts[6] as u32; // MethodDef
@@ -317,7 +345,7 @@ fn build_runtime_methods(raw: &RawModule) -> Vec<RuntimeMethod> {
         let owner_typedef_rid = method_owner[rid as usize];
         let owner = 0x0200_0000 | owner_typedef_rid;
 
-        let (header, il) = read_method_body(raw, md.rva);
+        let body = read_method_body(raw, md.rva);
 
         let token = 0x0600_0000 | rid;
 
@@ -326,8 +354,7 @@ fn build_runtime_methods(raw: &RawModule) -> Vec<RuntimeMethod> {
             owner,
             name,
             sig,
-            header,
-            il,
+            body
         });
     }
 
@@ -376,23 +403,6 @@ fn format_typedef_name(raw: &RawModule, td: &TypeDefRow) -> String {
     }
 }
 
-pub fn print_runtime_methods(raw:&RawModule, methods: &[RuntimeMethod]) {
-    for m in methods {
-        let td = &raw.tables.type_def[(token_rid(m.owner) - 1) as usize];
-        let tdname = format_typedef_name(raw, td);
-        println!(
-            "{:#010X} {}::{}  sig={}  maxstack={} codesize={} il={}",
-            m.token,
-            tdname,
-            m.name,
-            m.sig,
-            m.header.maxstack,
-            m.header.code_size,
-            hex_preview(&m.il, 32),
-        );
-    }
-}
-
 fn hex_preview(bytes: &[u8], max: usize) -> String {
     let take = bytes.len().min(max);
     let mut s = String::new();
@@ -406,10 +416,45 @@ fn hex_preview(bytes: &[u8], max: usize) -> String {
     s
 }
 
+fn print_runtime_methods(raw:&RawModule, methods: &[RuntimeMethod]) {
+    for m in methods {
+        let td = &raw.tables.type_def[(token_rid(m.owner) - 1) as usize];
+        let tdname = format_typedef_name(raw, td);
+        match &m.body{
+            Some((header, il)) => {
+                println!(
+                    "{:#010X} {}::{}  sig={}  maxstack={} codesize={} il={}",
+                    m.token,
+                    tdname,
+                    m.name,
+                    m.sig,
+                    header.maxstack,
+                    header.code_size,
+                    hex_preview(&il, 32),
+                );
+            },
+            None =>{
+                println!(
+                    "{:#010X} {}::{}  sig={}",
+                    m.token,
+                    tdname,
+                    m.name,
+                    m.sig
+                );
+            }
+        }
+        
+    }
+}
+
+pub fn print_runtime_module(raw:&RawModule, runtime_module:&RuntimeModule){
+    print_runtime_methods(raw, &runtime_module.runtime_methods);
+}
+
 //-----------------------------------------------------------------------
 
 
-pub fn create_runtime_module(raw:&RawModule){
-    let methods = build_runtime_methods(raw);
-    print_runtime_methods(raw, &methods);
+pub fn create_runtime_module(raw:&RawModule)->RuntimeModule{
+    let runtime_methods = build_runtime_methods(raw);
+    RuntimeModule { runtime_methods }
 }
